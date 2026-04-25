@@ -1,0 +1,25 @@
+services:
+  dimsum:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    volumes:
+      - .:/workspace
+
+    working_dir: /workspace
+
+    # Default to GPU
+    gpus: all
+
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+    stdin_open: true
+    tty: true
+
+    command: bash
+
+volumes:
+  dimsum_hf_cache:
