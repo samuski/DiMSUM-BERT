@@ -333,62 +333,118 @@ def evaluate_dev(model, loader, device, architecture: str, id2mwe: Dict[int, str
     }
 
 
+def normalize_mwe_tag(tag: Optional[str]) -> str:
+    """
+    Collapse DiMSUM's gappy lowercase MWE tags into simple BIO.
+
+    The official DiMSUM evaluator supports lowercase b/i/o only for valid
+    discontinuous MWEs. This baseline does not explicitly model gappy MWEs,
+    so writing lowercase sequences can create invalid outputs such as "bio".
+    For stable evaluation, predicted MWEs are normalized to standard B/I/O.
+    """
+    if tag in {"B", "b"}:
+        return "B"
+    if tag in {"I", "i"}:
+        return "I"
+    return "O"
+
+
 def clean_mwe_tags(tags: Sequence[str]) -> List[str]:
-    tags = list(tags)
-    n = len(tags)
-    for i in range(n):
-        if tags[i] == "I" and (i == 0 or tags[i - 1] not in ["B", "I"]):
-            tags[i] = "B"
-        elif tags[i] == "i" and (i == 0 or tags[i - 1] not in ["b", "i"]):
-            tags[i] = "b"
-    for i in range(n):
-        if tags[i] == "o" and (i == 0 or tags[i - 1] not in ["b", "i", "o"]):
-            tags[i] = "O"
-    for i in range(n):
-        if tags[i] == "B" and (i == n - 1 or tags[i + 1] != "I"):
-            tags[i] = "O"
-        elif tags[i] == "b" and (i == n - 1 or tags[i + 1] not in ["i", "o"]):
-            tags[i] = "O"
-    return tags
+    """
+    Minimal DiMSUM-safe cleanup.
+
+    Keep all six official MWE tags: B, I, O, b, i, o.
+    Do not collapse lowercase tags, because they encode gappy MWEs.
+    Only repair impossible starts that commonly crash the evaluator.
+    """
+    tags = [t if t in {"B", "I", "O", "b", "i", "o"} else "O" for t in tags]
+
+    cleaned = []
+    active = False
+
+    for t in tags:
+        if t in {"B", "b"}:
+            cleaned.append(t)
+            active = True
+
+        elif t in {"I", "i", "o"}:
+            if active:
+                cleaned.append(t)
+            else:
+                # Cannot continue/gap before any MWE has started.
+                cleaned.append("O")
+
+        else:
+            cleaned.append("O")
+            active = False
+
+    return cleaned
 
 
 def write_prediction_file(test_file: Path, pred_file: Path, mwe_preds: List[List[str]], sup_preds: List[List[Optional[str]]]):
+    """
+    Write predictions in DiMSUM tabular format.
+
+    Important:
+      - Only columns 4 and 5 are changed for MWE tagging.
+      - Column 7 is preserved for supersense predictions on B/O tokens.
+      - We do not emit lowercase gappy MWE tags because this model does not
+        explicitly reconstruct valid discontinuous-MWE structures.
+    """
     pred_file.parent.mkdir(parents=True, exist_ok=True)
     cleaned_mwe = [clean_mwe_tags(x) for x in mwe_preds]
+
     with test_file.open("r", encoding="utf-8") as f_in, pred_file.open("w", encoding="utf-8") as f_out:
         sent_idx, word_idx = 0, 0
         current_mwe_head = "0"
+
         for raw_line in f_in:
             line = raw_line.rstrip("\n")
+
             if not line.strip():
                 f_out.write("\n")
                 sent_idx += 1
                 word_idx = 0
                 current_mwe_head = "0"
                 continue
+
             cols = line.split("\t")
-            if len(cols) < 8:
-                while len(cols) < 8:
-                    cols.append("")
+            while len(cols) < 8:
+                cols.append("")
+
             if sent_idx < len(cleaned_mwe) and word_idx < len(cleaned_mwe[sent_idx]):
                 mwe = cleaned_mwe[sent_idx][word_idx]
                 sup = sup_preds[sent_idx][word_idx]
+                sup_out = sup if sup and sup != "O" else ""
+
                 if mwe in ["B", "b"]:
                     current_mwe_head = cols[0]
                     cols[4] = mwe
                     cols[5] = "0"
                     cols[6] = ""
                     cols[7] = sup if sup and sup != "O" else ""
-                elif mwe in ["I", "i", "o"]:
+
+                elif mwe in ["I", "i"]:
                     cols[4] = mwe
-                    cols[5] = current_mwe_head
+                    cols[5] = current_mwe_head if current_mwe_head != "0" else "0"
                     cols[6] = ""
                     cols[7] = ""
+
+                elif mwe == "o":
+                    # Gap token: keep lowercase o as official DiMSUM tag,
+                    # but do not attach it as a child of the MWE head.
+                    cols[4] = "o"
+                    cols[5] = "0"
+                    cols[6] = ""
+                    cols[7] = sup if sup and sup != "O" else ""
+
                 else:
+                    current_mwe_head = "0"
                     cols[4] = "O"
                     cols[5] = "0"
                     cols[6] = ""
                     cols[7] = sup if sup and sup != "O" else ""
+
             f_out.write("\t".join(cols) + "\n")
             word_idx += 1
 
@@ -413,22 +469,72 @@ def predict_and_write(model, loader, device, architecture: str, id2mwe, id2sup, 
 def run_official_eval(eval_file: Optional[Path], gold_file: Path, pred_file: Path) -> str:
     if not eval_file or not eval_file.exists():
         return "Official evaluator not found; skipped."
-    result = subprocess.run(["python", str(eval_file), str(gold_file), str(pred_file)], capture_output=True, text=True)
-    return result.stdout + result.stderr
+
+    cmd = ["python", str(eval_file), "-C", str(gold_file), str(pred_file)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    output = result.stdout + result.stderr
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Official evaluator failed with exit code {result.returncode}.\n"
+            f"Command: {' '.join(cmd)}\n\n{output}"
+        )
+
+    return output
 
 
-def parse_official_scores(text: str) -> Dict[str, str]:
-    scores = {}
-    for line in text.splitlines():
-        m = re.search(r"MWEs:.*F=([0-9.]+%)", line)
-        if m:
-            scores["official_mwe_f1"] = m.group(1)
-        m = re.search(r"Supersenses:.*F=([0-9.]+%)", line)
-        if m:
-            scores["official_sup_f1"] = m.group(1)
-        m = re.search(r"Combined:.*F=([0-9.]+%)", line)
-        if m:
-            scores["official_combined_f1"] = m.group(1)
+def _ratio_decimal_to_percent(value: str) -> Optional[float]:
+    try:
+        return float(value) * 100.0
+    except Exception:
+        return None
+
+
+def parse_official_scores(text: str) -> Dict[str, float]:
+    """
+    Parse official dimsumeval.py summary lines.
+
+    Expected lines look like:
+      MWEs: P=145/537=0.2700 R=145/1115=0.1300 F=17.55%
+      Supersenses: P=1498/3851=0.3890 R=1498/4745=0.3157 F=34.85%
+      Combined: Acc=11493/16500=0.6965 P=1643/4388=0.3744 R=1643/5860=0.2804 F=32.06%
+
+    Values are returned as percentages for easy table generation.
+    """
+    scores: Dict[str, float] = {}
+
+    task_map = {
+        "MWEs": "mwe",
+        "Supersenses": "sup",
+        "Combined": "combined",
+    }
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        for label, prefix in task_map.items():
+            if not line.startswith(label + ":"):
+                continue
+
+            acc = re.search(r"Acc=[^=\s]+=[ ]*([0-9.]+)", line)
+            p = re.search(r"\bP=[^=\s]+=[ ]*([0-9.]+)", line)
+            r = re.search(r"\bR=[^=\s]+=[ ]*([0-9.]+)", line)
+            f = re.search(r"\bF=([0-9.]+)%", line)
+
+            if acc:
+                val = _ratio_decimal_to_percent(acc.group(1))
+                if val is not None:
+                    scores[f"official_{prefix}_acc"] = val
+            if p:
+                val = _ratio_decimal_to_percent(p.group(1))
+                if val is not None:
+                    scores[f"official_{prefix}_precision"] = val
+            if r:
+                val = _ratio_decimal_to_percent(r.group(1))
+                if val is not None:
+                    scores[f"official_{prefix}_recall"] = val
+            if f:
+                scores[f"official_{prefix}_f1"] = float(f.group(1))
+
     return scores
 
 
@@ -485,8 +591,12 @@ def main():
     train_file = args.train_file or args.data_dir / "dimsum16.train"
     test_file = args.test_file or args.data_dir / "dimsum16.test"
     if args.eval_file is None:
-        candidate = args.data_dir.parent / "eval" / "dimsumeval.py"
-        args.eval_file = candidate if candidate.exists() else None
+        candidates = [
+            args.data_dir / "scripts" / "dimsumeval.py",
+            args.data_dir.parent / "scripts" / "dimsumeval.py",
+            args.data_dir.parent / "eval" / "dimsumeval.py",
+        ]
+        args.eval_file = next((c for c in candidates if c.exists()), None)
 
     print(f"train_file={train_file}")
     print(f"test_file={test_file}")
