@@ -686,8 +686,8 @@ def plot_heatmap(
 
     ax.set_xticks(range(n))
     ax.set_yticks(range(n))
-    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
-    ax.set_yticklabels(labels, fontsize=8)
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=15)
+    ax.set_yticklabels(labels, fontsize=15)
 
     # Keep labels generic because this function is also used for MWE matrices.
     ax.set_xlabel("Predicted label")
@@ -717,7 +717,7 @@ def plot_heatmap(
                     format(val, value_fmt),
                     ha="center",
                     va="center",
-                    fontsize=6,
+                    fontsize=12,
                     fontweight="bold",
                     color=text_color,
                     path_effects=[pe.withStroke(linewidth=1.25, foreground=stroke_color)],
