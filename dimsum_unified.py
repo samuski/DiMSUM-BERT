@@ -23,6 +23,7 @@ Example Colab:
 from __future__ import annotations
 
 import argparse
+from html import parser
 import json
 import os
 import random
@@ -351,52 +352,129 @@ def normalize_mwe_tag(tag: Optional[str]) -> str:
 
 def clean_mwe_tags(tags: Sequence[str]) -> List[str]:
     """
-    Minimal DiMSUM-safe cleanup.
+    DiMSUM-aware cleanup for the official 6-tag scheme.
 
-    Keep all six official MWE tags: B, I, O, b, i, o.
-    Do not collapse lowercase tags, because they encode gappy MWEs.
-    Only repair impossible starts that commonly crash the evaluator.
+    Keeps: B, I, O, b, i, o
+
+    Valid examples:
+      B I
+      B I I
+      B o o I
+      B b i I
+
+    Invalid examples repaired:
+      B O        -> O O
+      B o O      -> O O O
+      B o o i I  -> B o o o I
+      I O        -> O O
+      o I        -> O O
     """
-    tags = [t if t in {"B", "I", "O", "b", "i", "o"} else "O" for t in tags]
+    valid = {"B", "I", "O", "b", "i", "o"}
+    tags = [t if t in valid else "O" for t in tags]
+    n = len(tags)
+    out = ["O"] * n
 
-    cleaned = []
-    active = False
+    i = 0
+    while i < n:
+        t = tags[i]
 
-    for t in tags:
+        if t == "O":
+            i += 1
+            continue
+
+        # These cannot start an outer DiMSUM MWE chunk.
+        if t in {"I", "i", "o"}:
+            i += 1
+            continue
+
+        # Uppercase B starts the outer MWE chunk.
+        # Lowercase b at the start is repaired as uppercase B.
         if t in {"B", "b"}:
-            cleaned.append(t)
-            active = True
+            start = i
+            out[start] = "B"
 
-        elif t in {"I", "i", "o"}:
-            if active:
-                cleaned.append(t)
+            j = i + 1
+            found_upper_I = False
+            lower_b_active = False
+
+            while j < n:
+                tj = tags[j]
+
+                if tj == "O":
+                    break
+
+                if tj == "B":
+                    # New chunk begins. Stop current chunk here.
+                    break
+
+                if tj == "I":
+                    out[j] = "I"
+                    found_upper_I = True
+                    lower_b_active = False
+                    j += 1
+                    continue
+
+                if tj == "o":
+                    out[j] = "o"
+                    lower_b_active = False
+                    j += 1
+                    continue
+
+                if tj == "b":
+                    # Lowercase b starts a nested/weak expression inside a larger MWE.
+                    # It only stays b if followed by at least one i.
+                    if j + 1 < n and tags[j + 1] == "i":
+                        out[j] = "b"
+                        lower_b_active = True
+                    else:
+                        out[j] = "o"
+                        lower_b_active = False
+                    j += 1
+                    continue
+
+                if tj == "i":
+                    if lower_b_active:
+                        out[j] = "i"
+                    else:
+                        # Bare lowercase i is invalid after o/I/B.
+                        # Treat it as a gap marker inside the outer MWE.
+                        out[j] = "o"
+                    j += 1
+                    continue
+
+                break
+
+            if not found_upper_I:
+                # Singleton B or B...o without a final I is not a valid MWE.
+                for k in range(start, j):
+                    out[k] = "O"
             else:
-                # Cannot continue/gap before any MWE has started.
-                cleaned.append("O")
+                # Valid DiMSUM chunks must end with an uppercase I.
+                last_upper_I = max(k for k in range(start + 1, j) if out[k] == "I")
+                for k in range(last_upper_I + 1, j):
+                    out[k] = "O"
 
-        else:
-            cleaned.append("O")
-            active = False
+            i = j
+            continue
 
-    return cleaned
+        i += 1
+
+    return out
 
 
-def write_prediction_file(test_file: Path, pred_file: Path, mwe_preds: List[List[str]], sup_preds: List[List[Optional[str]]]):
-    """
-    Write predictions in DiMSUM tabular format.
-
-    Important:
-      - Only columns 4 and 5 are changed for MWE tagging.
-      - Column 7 is preserved for supersense predictions on B/O tokens.
-      - We do not emit lowercase gappy MWE tags because this model does not
-        explicitly reconstruct valid discontinuous-MWE structures.
-    """
+def write_prediction_file(
+    test_file: Path,
+    pred_file: Path,
+    mwe_preds: List[List[str]],
+    sup_preds: List[List[Optional[str]]],
+):
     pred_file.parent.mkdir(parents=True, exist_ok=True)
     cleaned_mwe = [clean_mwe_tags(x) for x in mwe_preds]
 
     with test_file.open("r", encoding="utf-8") as f_in, pred_file.open("w", encoding="utf-8") as f_out:
         sent_idx, word_idx = 0, 0
-        current_mwe_head = "0"
+        strong_head = "0"  # head for B ... I
+        weak_head = "0"    # head for b ... i
 
         for raw_line in f_in:
             line = raw_line.rstrip("\n")
@@ -405,7 +483,8 @@ def write_prediction_file(test_file: Path, pred_file: Path, mwe_preds: List[List
                 f_out.write("\n")
                 sent_idx += 1
                 word_idx = 0
-                current_mwe_head = "0"
+                strong_head = "0"
+                weak_head = "0"
                 continue
 
             cols = line.split("\t")
@@ -415,31 +494,45 @@ def write_prediction_file(test_file: Path, pred_file: Path, mwe_preds: List[List
             if sent_idx < len(cleaned_mwe) and word_idx < len(cleaned_mwe[sent_idx]):
                 mwe = cleaned_mwe[sent_idx][word_idx]
                 sup = sup_preds[sent_idx][word_idx]
-                sup_out = sup if sup and sup != "O" else ""
 
-                if mwe in ["B", "b"]:
-                    current_mwe_head = cols[0]
-                    cols[4] = mwe
+                if mwe == "B":
+                    strong_head = cols[0]
+                    weak_head = "0"
+                    cols[4] = "B"
                     cols[5] = "0"
                     cols[6] = ""
                     cols[7] = sup if sup and sup != "O" else ""
 
-                elif mwe in ["I", "i"]:
-                    cols[4] = mwe
-                    cols[5] = current_mwe_head if current_mwe_head != "0" else "0"
+                elif mwe == "I":
+                    cols[4] = "I"
+                    cols[5] = strong_head if strong_head != "0" else "0"
                     cols[6] = ""
                     cols[7] = ""
 
                 elif mwe == "o":
-                    # Gap token: keep lowercase o as official DiMSUM tag,
-                    # but do not attach it as a child of the MWE head.
+                    # Gap token inside a discontinuous MWE.
+                    # It is not linked to the MWE group, but it may have its own supersense.
                     cols[4] = "o"
                     cols[5] = "0"
                     cols[6] = ""
                     cols[7] = sup if sup and sup != "O" else ""
 
+                elif mwe == "b":
+                    weak_head = cols[0]
+                    cols[4] = "b"
+                    cols[5] = "0"
+                    cols[6] = ""
+                    cols[7] = sup if sup and sup != "O" else ""
+
+                elif mwe == "i":
+                    cols[4] = "i"
+                    cols[5] = weak_head if weak_head != "0" else "0"
+                    cols[6] = ""
+                    cols[7] = ""
+
                 else:
-                    current_mwe_head = "0"
+                    strong_head = "0"
+                    weak_head = "0"
                     cols[4] = "O"
                     cols[5] = "0"
                     cols[6] = ""
@@ -572,6 +665,8 @@ def main():
     parser.add_argument("--mount_drive", action="store_true")
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--quick_cpu", action="store_true", help="Small, CPU-friendly run for smoke testing.")
+    parser.add_argument("--mwe_loss_weight", type=float, default=1.0)
+    parser.add_argument("--sup_loss_weight", type=float, default=1.0)
     args = parser.parse_args()
 
     if args.mount_drive:
