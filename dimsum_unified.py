@@ -181,7 +181,15 @@ class DiMSUMDataset(Dataset):
 
 
 class LinearMultitaskTagger(nn.Module):
-    def __init__(self, model_name: str, num_mwe_tags: int, num_sup_tags: int, dropout: float = 0.1):
+    def __init__(
+        self,
+        model_name: str,
+        num_mwe_tags: int,
+        num_sup_tags: int,
+        dropout: float = 0.1,
+        mwe_loss_weight: float = 1.0,
+        sup_loss_weight: float = 1.0,
+    ):
         super().__init__()
         transformers_logging.set_verbosity_error()
         self.encoder = AutoModel.from_pretrained(model_name, use_safetensors=True).float()
@@ -193,6 +201,8 @@ class LinearMultitaskTagger(nn.Module):
         self.num_mwe_tags = num_mwe_tags
         self.num_sup_tags = num_sup_tags
         self.loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+        self.mwe_loss_weight = mwe_loss_weight
+        self.sup_loss_weight = sup_loss_weight
 
     def forward(self, input_ids, attention_mask, first_subword_mask=None, mwe_tags=None, sup_tags=None):
         out = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
@@ -208,12 +218,24 @@ class LinearMultitaskTagger(nn.Module):
             masked_mwe_tags = mwe_tags.masked_fill(~first_subword_mask, -100)
             mwe_loss = self.loss_fn(mwe_logits.view(-1, self.num_mwe_tags), masked_mwe_tags.view(-1))
             sup_loss = self.loss_fn(sup_logits.view(-1, self.num_sup_tags), sup_tags.view(-1))
-            return mwe_loss + sup_loss, mwe_preds, sup_preds
+            loss = (
+                self.mwe_loss_weight * mwe_loss
+                + self.sup_loss_weight * sup_loss
+            )
+            return loss, mwe_preds, sup_preds
         return mwe_preds, sup_preds
 
 
 class CRFMultitaskTagger(nn.Module):
-    def __init__(self, model_name: str, num_mwe_tags: int, num_sup_tags: int, dropout: float = 0.1):
+    def __init__(
+        self,
+        model_name: str,
+        num_mwe_tags: int,
+        num_sup_tags: int,
+        dropout: float = 0.1,
+        mwe_loss_weight: float = 1.0,
+        sup_loss_weight: float = 1.0,
+    ):
         super().__init__()
         if CRF is None:
             raise RuntimeError("pytorch-crf is required for --architecture mtl_crf. Install with: pip install pytorch-crf")
@@ -228,6 +250,8 @@ class CRFMultitaskTagger(nn.Module):
         self.num_mwe_tags = num_mwe_tags
         self.num_sup_tags = num_sup_tags
         self.loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+        self.mwe_loss_weight = mwe_loss_weight
+        self.sup_loss_weight = sup_loss_weight
 
     def forward(self, input_ids, attention_mask, first_subword_mask=None, mwe_tags=None, sup_tags=None):
         out = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
@@ -250,15 +274,42 @@ class CRFMultitaskTagger(nn.Module):
         if mwe_tags is not None and sup_tags is not None:
             mwe_loss = -self.crf(mwe_logits, mwe_tags, mask=crf_mask.bool(), reduction="mean")
             sup_loss = self.loss_fn(sup_logits.view(-1, self.num_sup_tags), sup_tags.view(-1))
-            return mwe_loss + sup_loss, mwe_preds, sup_preds
+
+            loss = (
+                self.mwe_loss_weight * mwe_loss
+                + self.sup_loss_weight * sup_loss
+            )
+            return loss, mwe_preds, sup_preds
         return mwe_preds, sup_preds
 
 
-def make_model(architecture: str, model_name: str, num_mwe_tags: int, num_sup_tags: int, dropout: float):
+def make_model(
+    architecture: str,
+    model_name: str,
+    num_mwe_tags: int,
+    num_sup_tags: int,
+    dropout: float,
+    mwe_loss_weight: float,
+    sup_loss_weight: float,
+):
     if architecture == "linear":
-        return LinearMultitaskTagger(model_name, num_mwe_tags, num_sup_tags, dropout)
+        return LinearMultitaskTagger(
+            model_name,
+            num_mwe_tags,
+            num_sup_tags,
+            dropout,
+            mwe_loss_weight,
+            sup_loss_weight,
+        )
     if architecture == "mtl_crf":
-        return CRFMultitaskTagger(model_name, num_mwe_tags, num_sup_tags, dropout)
+        return CRFMultitaskTagger(
+            model_name,
+            num_mwe_tags,
+            num_sup_tags,
+            dropout,
+            mwe_loss_weight,
+            sup_loss_weight,
+        )
     raise ValueError(f"Unknown architecture: {architecture}")
 
 
@@ -723,7 +774,15 @@ def main():
         json.dump({"mwe2id": mwe2id, "sup2id": sup2id}, f, indent=2)
 
     start = time.time()
-    model = make_model(args.architecture, args.model_name, len(mwe2id), len(sup2id), args.dropout)
+    model = make_model(
+        args.architecture,
+        args.model_name,
+        len(mwe2id),
+        len(sup2id),
+        args.dropout,
+        args.mwe_loss_weight,
+        args.sup_loss_weight,
+    )
     train_one(model, train_loader, device, args.epochs, args.lr, args.grad_clip)
     dev_metrics = evaluate_dev(model, dev_loader, device, args.architecture, id2mwe, id2sup)
     print("dev_metrics=", dev_metrics)
