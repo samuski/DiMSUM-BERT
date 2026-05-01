@@ -581,7 +581,7 @@ def write_markdown_report(
         config_rows = []
         for key in ["architecture", "model_name", "epochs", "batch_size", "lr", "seconds", "dev_loss", "mwe_macro_f1", "sup_macro_f1"]:
             if key in summary:
-                config_rows.append([key, fmt_num(summary[key]) if isinstance(summary[key], float) else summary[key]])
+                config_rows.append([key, format_config_value(key, summary.get(key, ""))])
         if config_rows:
             lines.extend(make_markdown_table(["field", "value"], config_rows, ["left", "left"]))
             lines.append("")
@@ -641,6 +641,11 @@ def write_markdown_report(
     lines.append("- `supersense_per_label_metrics.csv`: per-label precision, recall, and F1")
     lines.append("- `sentence_errors.md`: qualitative sentence-level examples")
     lines.append("- `token_errors.csv`: token-level data for spreadsheet filtering")
+
+    loss_lines = write_loss_history_report(out_dir, summary)
+    if loss_lines:
+        lines.append("")
+        lines.extend(loss_lines)
 
     (out_dir / "summary_report.md").write_text("\n".join(lines), encoding="utf-8")
 
@@ -976,6 +981,96 @@ def resolve_args(args: argparse.Namespace) -> argparse.Namespace:
     args.gold = args.gold or Path("dimsum-data/dimsum16.test")
     return args
 
+def write_loss_history_report(out_dir: Path, summary: dict):
+    history = summary.get("loss_history", [])
+
+    if not history:
+        return []
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    csv_path = out_dir / "loss_history.csv"
+    png_path = out_dir / "loss_curve.png"
+
+    # Save CSV
+    with csv_path.open("w", encoding="utf-8") as f:
+        f.write("epoch,train_loss,lr\n")
+        for row in history:
+            f.write(
+                f"{row.get('epoch','')},"
+                f"{row.get('train_loss','')},"
+                f"{row.get('lr','')}\n"
+            )
+
+    # Save plot
+    try:
+        import matplotlib.pyplot as plt
+
+        epochs = [row["epoch"] for row in history]
+        train_losses = [row["train_loss"] for row in history]
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(epochs, train_losses, marker="o", label="Train loss")
+
+        ax.set_title("Training Loss by Epoch", fontsize=16)
+        ax.set_xlabel("Epoch", fontsize=13)
+        ax.set_ylabel("Loss", fontsize=13)
+        ax.tick_params(axis="both", labelsize=11)
+        ax.legend(fontsize=11)
+        ax.grid(True, alpha=0.3)
+
+        fig.tight_layout()
+        fig.savefig(png_path, dpi=220)
+        plt.close(fig)
+
+    except Exception as exc:
+        print(f"Could not generate loss curve: {exc}")
+
+    # Markdown section
+    lines = []
+    lines.append("## Loss history")
+    lines.append("")
+    lines.append("| epoch | train loss | learning rate |")
+    lines.append("| ----: | ---------: | ------------: |")
+
+    for row in history:
+        epoch = row.get("epoch", "")
+        train_loss = row.get("train_loss", "")
+        lr = row.get("lr", "")
+
+        train_loss_str = f"{train_loss:.4f}" if isinstance(train_loss, (int, float)) else str(train_loss)
+        lr_str = f"{lr:.2e}" if isinstance(lr, (int, float)) else str(lr)
+
+        lines.append(f"| {epoch} | {train_loss_str} | {lr_str} |")
+
+    lines.append("")
+    lines.append("![Training loss curve](loss_curve.png)")
+    lines.append("")
+
+    return lines
+
+def format_config_value(key, value):
+    if value is None:
+        return ""
+
+    # Learning rates are tiny, so decimal formatting makes them look like 0.00.
+    if key in {"lr", "learning_rate"} and isinstance(value, (int, float)):
+        return f"{value:.2e}"
+
+    # These are readable as normal decimals.
+    if key in {
+        "seconds",
+        "dev_loss",
+        "mwe_macro_f1",
+        "sup_macro_f1",
+        "dropout",
+        "grad_clip",
+        "mwe_loss_weight",
+        "sup_loss_weight",
+    } and isinstance(value, (int, float)):
+        return f"{value:.2f}"
+
+    return str(value)
 
 def main() -> None:
     parser = argparse.ArgumentParser()
