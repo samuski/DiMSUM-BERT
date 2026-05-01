@@ -253,6 +253,40 @@ class CRFMultitaskTagger(nn.Module):
         self.mwe_loss_weight = mwe_loss_weight
         self.sup_loss_weight = sup_loss_weight
 
+    @staticmethod
+    def _pack_crf_inputs(
+        mwe_logits: torch.Tensor,
+        first_subword_mask: Optional[torch.Tensor],
+        attention_mask: torch.Tensor,
+        mwe_tags: Optional[torch.Tensor] = None,
+    ):
+        if first_subword_mask is None:
+            return mwe_logits, mwe_tags, attention_mask.bool()
+
+        batch_size, _, num_tags = mwe_logits.shape
+        packed_positions = []
+        max_len = 0
+
+        for i in range(batch_size):
+            positions = torch.where(first_subword_mask[i])[0]
+            packed_positions.append(positions)
+            max_len = max(max_len, int(positions.numel()))
+
+        packed_logits = mwe_logits.new_zeros((batch_size, max_len, num_tags))
+        packed_mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=mwe_logits.device)
+        packed_tags = None
+        if mwe_tags is not None:
+            packed_tags = mwe_tags.new_zeros((batch_size, max_len))
+
+        for i, positions in enumerate(packed_positions):
+            length = int(positions.numel())
+            packed_logits[i, :length] = mwe_logits[i, positions]
+            packed_mask[i, :length] = True
+            if packed_tags is not None:
+                packed_tags[i, :length] = mwe_tags[i, positions]
+
+        return packed_logits, packed_tags, packed_mask
+
     def forward(self, input_ids, attention_mask, first_subword_mask=None, mwe_tags=None, sup_tags=None):
         out = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         out = self.dropout(out)
@@ -260,19 +294,20 @@ class CRFMultitaskTagger(nn.Module):
         mwe_logits = self.mwe_head(out)
         sup_logits = self.sup_head(out)
 
-        # CRF requires the first timestep to be valid. We include [CLS] for CRF mechanics,
-        # then skip it when aligning predictions back to words.
-        if first_subword_mask is not None:
-            crf_mask = first_subword_mask.clone()
-            crf_mask[:, 0] = True
-        else:
-            crf_mask = attention_mask.bool()
+        # torchcrf expects each sequence mask to be contiguous. Pack first-subword
+        # emissions into word-level CRF sequences before scoring/decoding.
+        crf_logits, crf_tags, crf_mask = self._pack_crf_inputs(
+            mwe_logits,
+            first_subword_mask,
+            attention_mask,
+            mwe_tags,
+        )
 
-        mwe_preds = self.crf.decode(mwe_logits, mask=crf_mask.bool())
+        mwe_preds = self.crf.decode(crf_logits, mask=crf_mask)
         sup_preds = torch.argmax(sup_logits, dim=-1)
 
         if mwe_tags is not None and sup_tags is not None:
-            mwe_loss = -self.crf(mwe_logits, mwe_tags, mask=crf_mask.bool(), reduction="mean")
+            mwe_loss = -self.crf(crf_logits, crf_tags, mask=crf_mask, reduction="mean")
             sup_loss = self.loss_fn(sup_logits.view(-1, self.num_sup_tags), sup_tags.view(-1))
 
             loss = (
@@ -320,25 +355,59 @@ def split_train_dev(data: Sequence[Sentence], dev_split: float, seed: int):
     return items[:split], items[split:]
 
 
-def train_one(model, loader, device, epochs: int, lr: float, grad_clip: float):
+def train_one(
+    model,
+    loader,
+    device,
+    epochs: int,
+    lr: float,
+    grad_clip: float,
+):
     model.to(device)
     optimizer = AdamW(model.parameters(), lr=lr)
+
+    loss_history = []
+
     for epoch in range(epochs):
         model.train()
         total = 0.0
+
         bar = tqdm(loader, desc=f"epoch {epoch + 1}/{epochs}")
+
         for batch in bar:
             batch = [x.to(device) for x in batch]
+
             optimizer.zero_grad(set_to_none=True)
+
             loss, _, _ = model(*batch[:3], mwe_tags=batch[3], sup_tags=batch[4])
+
             loss.backward()
+
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
             optimizer.step()
+
             total += float(loss.item())
             bar.set_postfix(loss=f"{loss.item():.4f}")
-        print(f"epoch {epoch + 1}: avg_train_loss={total / max(len(loader), 1):.4f}")
-    return model
+
+        avg_train_loss = total / max(len(loader), 1)
+
+        row = {
+            "epoch": epoch + 1,
+            "train_loss": avg_train_loss,
+            "lr": optimizer.param_groups[0]["lr"],
+        }
+
+        loss_history.append(row)
+
+        print(
+            f"epoch {epoch + 1}: "
+            f"avg_train_loss={avg_train_loss:.4f}, "
+            f"lr={optimizer.param_groups[0]['lr']:.2e}"
+        )
+
+    return model, loss_history
 
 
 def macro_f1(y_true, y_pred) -> float:
@@ -352,8 +421,7 @@ def macro_f1(y_true, y_pred) -> float:
 
 def decode_mwe_predictions(architecture: str, raw_preds, valid_indices: torch.Tensor, id2mwe: Dict[int, str]) -> List[str]:
     if architecture == "mtl_crf":
-        # raw_preds contains [CLS] plus valid word positions because CRF mask forced position 0.
-        return [id2mwe[raw_preds[j + 1]] for j in range(len(valid_indices))]
+        return [id2mwe[raw_preds[j]] for j in range(len(valid_indices))]
     return [id2mwe[raw_preds[int(idx)]] for idx in valid_indices]
 
 
@@ -783,7 +851,14 @@ def main():
         args.mwe_loss_weight,
         args.sup_loss_weight,
     )
-    train_one(model, train_loader, device, args.epochs, args.lr, args.grad_clip)
+    model, loss_history = train_one(
+        model,
+        train_loader,
+        device,
+        args.epochs,
+        args.lr,
+        args.grad_clip,
+    )
     dev_metrics = evaluate_dev(model, dev_loader, device, args.architecture, id2mwe, id2sup)
     print("dev_metrics=", dev_metrics)
 
@@ -806,10 +881,25 @@ def main():
         pred_file=str(pred_file),
         model_file=str(model_file),
     )
-    summary = {**asdict(result), **parse_official_scores(eval_text), "seconds": round(time.time() - start, 2)}
+    summary = {
+        **asdict(result),
+        **parse_official_scores(eval_text),
+        "seconds": round(time.time() - start, 2),
+        "loss_history": loss_history,
+        "dropout": args.dropout,
+        "grad_clip": args.grad_clip,
+        "mwe_loss_weight": args.mwe_loss_weight,
+        "sup_loss_weight": args.sup_loss_weight,
+    }
     with (run_dir / "summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
     print(json.dumps(summary, indent=2))
+    loss_csv = run_dir / "loss_history.csv"
+    
+    with loss_csv.open("w", encoding="utf-8") as f:
+        f.write("epoch,train_loss,lr\n")
+        for row in loss_history:
+            f.write(f"{row['epoch']},{row['train_loss']},{row['lr']}\n")
 
 
 if __name__ == "__main__":
